@@ -2,107 +2,246 @@
   channel = "stable-24.11";
 
   packages = [
-    pkgs.docker
+    pkgs.qemu
+    pkgs.htop
     pkgs.cloudflared
-    pkgs.socat
     pkgs.coreutils
     pkgs.gnugrep
-    pkgs.systemd
-    pkgs.unzip
+    pkgs.wget
+    pkgs.git
+    pkgs.python3
   ];
 
-  services.docker.enable = true;
-
   idx.workspace.onStart = {
-    novnc = ''
-      set -euo pipefail
+    qemu = ''
+      set -e
 
-      # One-time cleanup (safer: keep dotfiles and the idx folder)
+      # =========================
+      # One-time cleanup
+      # =========================
       if [ ! -f /home/user/.cleanup_done ]; then
         rm -rf /home/user/.gradle/* /home/user/.emu/* || true
         find /home/user -mindepth 1 -maxdepth 1 \
-          ! -name 'idx-ubuntu22-gui' \
+          ! -name 'idx-linux-gui' \
+          ! -name '.cleanup_done' \
           ! -name '.*' \
           -exec rm -rf {} + || true
         touch /home/user/.cleanup_done
       fi
 
-      CONTAINER_NAME=ubuntu-novnc
-      IMAGE=thuonghai2711/ubuntu-novnc-pulseaudio:22.04
+      # =========================
+      # Paths
+      # =========================
+      VM_DIR="$HOME/qemu"
+      DISK="$VM_DIR/ubuntu.qcow2"
+      SEED_ISO="$VM_DIR/seed.iso"
+      NOVNC_DIR="$HOME/noVNC"
 
-      # Create the container if missing; otherwise start it
-      if ! docker ps -a --format '{{.Names}}' | grep -qx "$CONTAINER_NAME"; then
-        docker run --name "$CONTAINER_NAME" \
-          --shm-size 1g \
-          -d \
-          --cap-add=SYS_ADMIN \
-          -p 8080:10000 \
-          -e VNC_PASSWD=12345678 \
-          -e PORT=10000 \
-          -e AUDIO_PORT=1699 \
-          -e WEBSOCKIFY_PORT=6900 \
-          -e VNC_PORT=5900 \
-          -e SCREEN_WIDTH=1024 \
-          -e SCREEN_HEIGHT=768 \
-          -e SCREEN_DEPTH=24 \
-          "$IMAGE"
+      mkdir -p "$VM_DIR"
+
+      # =========================
+      # Download Ubuntu 24.04 cloud image if missing
+      # =========================
+      if [ ! -f "$DISK" ]; then
+        echo "Downloading Ubuntu 24.04 cloud image..."
+        wget -O "$DISK" \
+          https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img
+        echo "Resizing disk to 20G..."
+        qemu-img resize "$DISK" 20G
       else
-        docker start "$CONTAINER_NAME" || true
+        echo "Ubuntu disk already exists, skipping download."
       fi
 
-      # Wait for container to be running and accept execs
-      for i in 1 2 3 4 5 6 7 8 9 10; do
-        if docker exec "$CONTAINER_NAME" bash -lc "echo ok" >/dev/null 2>&1; then
-          break
-        fi
-        echo "waiting for container to be ready... ($i)"
-        sleep 2
-      done
+      # =========================
+      # Create cloud-init seed ISO
+      # =========================
+      if [ ! -f "$SEED_ISO" ]; then
+        echo "Creating cloud-init seed ISO..."
+        mkdir -p /tmp/cidata
 
-      # Install Chrome inside the container as root (no sudo)
-      docker exec "$CONTAINER_NAME" bash -lc '
-        set -euo pipefail
-        apt-get update -y || true
-        apt-get remove -y firefox || true
-        apt-get install -y wget apt-transport-https ca-certificates gnupg lsb-release || true
+        cat > /tmp/cidata/meta-data << 'EOF'
+instance-id: ubuntu-qemu-01
+local-hostname: ubuntu-vm
+EOF
 
-        # Download and install Chrome .deb (retry if network flakey)
-        TMPDEB=/tmp/chrome.deb
-        if wget -O "$TMPDEB" https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb; then
-          apt-get install -y "$TMPDEB" || apt-get -f install -y
-          rm -f "$TMPDEB"
+        cat > /tmp/cidata/user-data << 'EOF'
+#cloud-config
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    shell: /bin/bash
+    lock_passwd: false
+    plain_text_passwd: "ubuntu"
+
+chpasswd:
+  expire: false
+
+ssh_pwauth: true
+
+package_update: true
+package_upgrade: false
+
+packages:
+  - xfce4
+  - xfce4-goodies
+  - x11vnc
+  - xvfb
+  - dbus-x11
+  - wget
+  - curl
+  - htop
+  - nano
+  - net-tools
+
+runcmd:
+  - mkdir -p /home/ubuntu/.vnc
+  - echo "ubuntu" | x11vnc -storepasswd - /home/ubuntu/.vnc/passwd
+  - chown -R ubuntu:ubuntu /home/ubuntu/.vnc
+  - |
+    cat > /home/ubuntu/start-vnc.sh << 'VNCEOF'
+    #!/bin/bash
+    export DISPLAY=:0
+    Xvfb :0 -screen 0 1280x800x24 &
+    sleep 2
+    startxfce4 &
+    sleep 3
+    x11vnc -display :0 -rfbport 5900 -passwd ubuntu -forever -shared -bg
+    VNCEOF
+  - chmod +x /home/ubuntu/start-vnc.sh
+  - chown ubuntu:ubuntu /home/ubuntu/start-vnc.sh
+  - |
+    cat > /etc/systemd/system/xvnc.service << 'SVCEOF'
+    [Unit]
+    Description=XFCE + x11vnc Desktop
+    After=network.target
+
+    [Service]
+    User=ubuntu
+    Environment=DISPLAY=:0
+    ExecStartPre=/bin/bash -c "Xvfb :0 -screen 0 1280x800x24 &"
+    ExecStartPre=/bin/sleep 2
+    ExecStart=/bin/bash -c "startxfce4 & sleep 3 && x11vnc -display :0 -rfbport 5900 -passwd ubuntu -forever -shared"
+    Restart=on-failure
+
+    [Install]
+    WantedBy=multi-user.target
+    SVCEOF
+  - systemctl enable xvnc.service
+EOF
+
+        python3 << 'PYEOF'
+import subprocess, shutil
+
+try:
+    subprocess.run(['dd', 'if=/dev/zero', 'of=/tmp/seed.img',
+                    'bs=1k', 'count=2048'], check=True, capture_output=True)
+    subprocess.run(['mkfs.vfat', '-n', 'cidata', '/tmp/seed.img'],
+                   check=True, capture_output=True)
+    subprocess.run(['mcopy', '-i', '/tmp/seed.img',
+                    '/tmp/cidata/meta-data', '::meta-data'],
+                   check=True, capture_output=True)
+    subprocess.run(['mcopy', '-i', '/tmp/seed.img',
+                    '/tmp/cidata/user-data', '::user-data'],
+                   check=True, capture_output=True)
+    shutil.copy('/tmp/seed.img', '/tmp/seed_final.img')
+    print("Seed image created via vfat")
+except Exception as e:
+    print(f"vfat failed: {e}, trying genisoimage...")
+    try:
+        subprocess.run(
+            ['genisoimage', '-output', '/tmp/seed_final.img',
+             '-volid', 'cidata', '-joliet', '-rock',
+             '/tmp/cidata/meta-data', '/tmp/cidata/user-data'],
+            check=True, capture_output=True)
+        print("Seed image created via genisoimage")
+    except Exception as e2:
+        print(f"Both methods failed: {e2}")
+PYEOF
+
+        if [ -f /tmp/seed_final.img ]; then
+          cp /tmp/seed_final.img "$SEED_ISO"
+          echo "Seed ISO created."
         else
-          echo "WARNING: chrome download failed"
-        fi
-      '
-
-      # Run cloudflared in background and capture logs (consider systemd for permanence)
-      CLOUD_LOG=/tmp/cloudflared.log
-      nohup cloudflared tunnel --no-autoupdate --url http://localhost:8080 > "$CLOUD_LOG" 2>&1 &
-
-      # Give it a few seconds to start
-      sleep 8
-
-      # Attempt to extract the public tunnel URL (trycloudflare domains)
-      if grep -q -E "trycloudflare\\.com|trycloudflare" "$CLOUD_LOG" 2>/dev/null; then
-        URL=$(grep -o -E "https?://[a-z0-9.-]*trycloudflare\\.com(:[0-9]+)?" "$CLOUD_LOG" | head -n1 || true)
-        if [ -n "$URL" ]; then
-          echo "========================================="
-          echo " 🌍 Your Cloudflared tunnel is ready:"
-          echo "     $URL"
-          echo "========================================="
-        else
-          echo "❌ Couldn't parse URL from $CLOUD_LOG"
+          echo "⚠️ Seed ISO failed, booting without cloud-init."
+          touch "$SEED_ISO"
         fi
       else
-        echo "❌ Cloudflared tunnel failed to start or no trycloudflare URL found. See $CLOUD_LOG"
+        echo "Seed ISO already exists, skipping."
       fi
 
-      # Keep container/runner alive for developer preview (intentional long-running loop)
+      # =========================
+      # Clone noVNC if missing
+      # =========================
+      if [ ! -d "$NOVNC_DIR/.git" ]; then
+        echo "Cloning noVNC..."
+        mkdir -p "$NOVNC_DIR"
+        git clone https://github.com/novnc/noVNC.git "$NOVNC_DIR"
+      else
+        echo "noVNC already exists, skipping clone."
+      fi
+
+      # =========================
+      # Start QEMU
+      # =========================
+      echo "Starting QEMU with Ubuntu..."
+      nohup qemu-system-x86_64 \
+        -enable-kvm \
+        -cpu host \
+        -smp 4,cores=4 \
+        -m 8192 \
+        -M q35 \
+        -device usb-tablet \
+        -vga virtio \
+        -netdev user,id=n0,hostfwd=tcp::2222-:22 \
+        -net nic,netdev=n0,model=virtio-net-pci \
+        -drive file="$DISK",format=qcow2,if=virtio \
+        -drive file="$SEED_ISO",format=raw,if=virtio,readonly=on \
+        -vnc :0 \
+        -display none \
+        > /tmp/qemu.log 2>&1 &
+
+      echo "QEMU started. Waiting for VM to boot..."
+      sleep 5
+
+      # =========================
+      # Start noVNC on port 8888
+      # =========================
+      echo "Starting noVNC..."
+      nohup "$NOVNC_DIR/utils/novnc_proxy" \
+        --vnc 127.0.0.1:5900 \
+        --listen 8888 \
+        > /tmp/novnc.log 2>&1 &
+
+      # =========================
+      # Start Cloudflared tunnel
+      # =========================
+      echo "Starting Cloudflared tunnel..."
+      nohup cloudflared tunnel \
+        --no-autoupdate \
+        --url http://localhost:8888 \
+        > /tmp/cloudflared.log 2>&1 &
+
+      sleep 15
+
+      if grep -q "trycloudflare.com" /tmp/cloudflared.log; then
+        URL=$(grep -o "https://[a-z0-9.-]*trycloudflare.com" /tmp/cloudflared.log | head -n1)
+        echo "========================================="
+        echo " 🐧 Ubuntu Server + XFCE ready:"
+        echo "     $URL/vnc.html"
+        echo "     VNC Password: ubuntu"
+        echo "     SSH: ssh -p 2222 ubuntu@localhost"
+        echo "========================================="
+      else
+        echo "❌ Cloudflared tunnel failed. Check /tmp/cloudflared.log"
+      fi
+
+      # =========================
+      # Keep workspace alive
+      # =========================
       elapsed=0
       while true; do
-        echo "Time elapsed: ${elapsed} min"
-        elapsed=$((elapsed + 1))
+        echo "⏱️  Time elapsed: $elapsed min | QEMU: $(pgrep qemu-system > /dev/null && echo running || echo STOPPED)"
+        ((elapsed++))
         sleep 60
       done
     '';
@@ -111,12 +250,16 @@
   idx.previews = {
     enable = true;
     previews = {
-      novnc = {
+      qemu = {
         manager = "web";
         command = [
           "bash" "-lc"
-          "socat TCP-LISTEN:$PORT,fork,reuseaddr TCP:127.0.0.1:8080"
+          "echo 'noVNC running on port 8888'"
         ];
+      };
+      terminal = {
+        manager = "web";
+        command = [ "bash" ];
       };
     };
   };
